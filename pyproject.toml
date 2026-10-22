@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ohamlab-agent-lab"
+version = "0.1.0"
+description = "A configurable agent runtime that connects LLMs to MCP tools."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "OhamLab contributors" }]
+dependencies = [
+  "ohamlab-agent>=0.1.2",
+  "mcp>=1.9.0",
+  "httpx>=0.27.0",
+  "openai>=1.60.0",
+  "anthropic>=0.45.0",
+  "pydantic>=2.7.0",
+  "PyYAML>=6.0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.9"]
+
+[project.scripts]
+ohamlab-agent = "ohamlab_agent_lab.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ohamlab_agent_lab"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
