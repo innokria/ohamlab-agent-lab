@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -1165,6 +1166,88 @@ with gr.Blocks(
         )
 
     # ========================================================
+    # Command Center: searchable task listing + inspector
+    # ========================================================
+    with gr.Tab("Command Center"):
+        gr.Markdown("## Task Command Center\nLive tasks from the existing task manager / Hugging Face Bucket backend.")
+        with gr.Row():
+            cc_search = gr.Textbox(label="Search task ID, instructions, agent, or status", scale=4)
+            cc_status = gr.Dropdown(["All", "queued", "pending", "running", "completed", "failed", "cancelled"], value="All", label="Status", scale=1)
+            cc_refresh = gr.Button("Refresh", scale=1)
+        cc_summary = gr.Markdown()
+        cc_table = gr.Dataframe(headers=["Task ID", "Task", "Agent", "Status", "Created", "Updated", "Report", "Error"], interactive=False, label="Stored tasks", wrap=True, max_height=470)
+        with gr.Row():
+            cc_id = gr.Textbox(label="Inspect task ID", placeholder="Paste full task ID")
+            cc_inspect = gr.Button("Open task", variant="primary")
+        cc_details = gr.JSON(label="Complete task record")
+        gr.Markdown("### Submit a task")
+        with gr.Row():
+            cc_agent = gr.Dropdown(choices=agent_choices(), label="Assigned agent", scale=2)
+            cc_async = gr.Checkbox(value=True, label="Background execution", scale=1)
+        cc_instruction = gr.Textbox(label="Task instructions", lines=4, placeholder="Find public information about rahul7star... or write Python code...")
+        cc_submit = gr.Button("Create and run task", variant="primary")
+        cc_submit_result = gr.Markdown()
+        cc_created_id = gr.Textbox(label="Created task ID")
+
+        def command_center_rows(query="", status="All"):
+            items = task_manager.list()
+            q = (query or "").strip().casefold()
+            output = []
+            for t in items:
+                instruction = str(getattr(t, "task", ""))
+                agent_id = str(getattr(t, "agent_id", ""))
+                state = str(getattr(t, "status", ""))
+                if status != "All" and state.casefold() != status.casefold():
+                    continue
+                if q and q not in " ".join([str(t.task_id), instruction, agent_id, state]).casefold():
+                    continue
+                output.append([str(t.task_id), instruction, agent_id, state,
+                               str(getattr(t, "created_at", "")), str(getattr(t, "updated_at", "")),
+                               str(getattr(t, "report_path", "")), str(getattr(t, "error", ""))])
+            return output, f"**Showing {len(output)} of {len(items)} stored tasks**"
+
+        cc_search.change(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
+        cc_status.change(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
+        cc_refresh.click(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
+        cc_inspect.click(inspect_task, [cc_id], [cc_details])
+        cc_submit.click(run_agent_ui, [cc_agent, cc_instruction, cc_async],
+                        [cc_submit_result, cc_created_id, current_tasks],
+                        ).then(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
+        cc_timer = gr.Timer(8)
+        cc_timer.tick(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
+        demo.load(command_center_rows, outputs=[cc_table, cc_summary])
+
+    # ========================================================
+    # Agent Quality Lab: dataset-backed checklist inspection
+    # This is a catalogue; it does NOT fabricate evaluation scores.
+    # ========================================================
+    with gr.Tab("Agent Quality Lab"):
+        gr.Markdown("## Agent Quality Lab\nExplore applicable checklist cases. Automated evaluation requires dedicated case runners and evidence collection.")
+        quality_df = gr.State(pd.DataFrame())
+        with gr.Row():
+            quality_dataset_id = gr.Textbox(value=DEFAULT_DATASET_ID, label="Checklist dataset", scale=4)
+            quality_config = gr.Textbox(label="Dataset config (optional)", scale=1)
+            quality_load = gr.Button("Load checklist", variant="primary")
+        quality_info = gr.Markdown("Load the checklist to browse its cases.")
+        quality_search = gr.Textbox(label="Search checklist", placeholder="Search test title, priority, severity, category...")
+        quality_table = gr.Dataframe(label="Evaluation cases", interactive=False, max_height=500, wrap=True)
+        quality_details = gr.JSON(label="Selected evaluation case")
+        def quality_load_fn(dataset_id, config):
+            df, _, compact, summary, *_ = load_checklist_dataset(dataset_id, config)
+            return df, compact, summary
+        def quality_filter_fn(df, q):
+            if df is None or df.empty:
+                return pd.DataFrame()
+            if not (q or "").strip():
+                return compact_checklist_table(df)
+            mask = df.astype(str).apply(lambda c: c.str.contains(q, case=False, regex=False, na=False)).any(axis=1)
+            return compact_checklist_table(df.loc[mask])
+        quality_load.click(quality_load_fn, [quality_dataset_id, quality_config], [quality_df, quality_table, quality_info])
+        quality_search.change(quality_filter_fn, [quality_df, quality_search], [quality_table])
+        # Inspect the displayed, filtered rows rather than an unfiltered index.
+        quality_table.select(inspect_checklist_row, [quality_table], [quality_details])
+
+    # ========================================================
     # Shared event handlers
     # ========================================================
 
@@ -1282,6 +1365,8 @@ application = gr.mount_gradio_app(
     application,
     demo,
     path="/ui",
+    auth=(os.getenv("UIUSER", "admin"), os.environ["UIPASS"]),
+    auth_message="Sign in to OhamLab Agent Lab",
 )
 
 
