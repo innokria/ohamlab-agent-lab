@@ -25,6 +25,11 @@ from ohamlab_agent_lab.api import (
 )
 from ohamlab_agent_lab.mcp_server import mcp
 from ohamlab_agent_lab.models import CreateAgentRequest
+from ohamlab_remote_mcp import install_runtime_integration, discover_remote_tools
+
+
+# Enable remote MCP tool calling on the shared runtime (UI / API / MCP tasks).
+install_runtime_integration(runtime)
 
 
 # ============================================================
@@ -59,7 +64,7 @@ def ensure_starter_agent():
                 name="Researcher",
                 description="Starter agent for research and report tasks.",
                 execution_mode="workflow",
-                workflow="report",
+                workflow="mcp_research" if os.getenv("OHAMLAB_MCP_URL") else "report",
                 system_prompt=(
                     "You are a helpful research agent. "
                     "Analyse the task, organise your findings, "
@@ -752,7 +757,7 @@ with gr.Blocks(
                 )
 
                 workflow = gr.Dropdown(
-                    ["report", "echo"],
+                    ["report", "echo", "mcp_research"],
                     value="report",
                     label="Workflow",
                 )
