@@ -32,6 +32,30 @@ import os
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any
+import logging
+
+logger = logging.getLogger(__name__)
+
+def _root_errors(exc: BaseException) -> list[BaseException]:
+    """Flatten AnyIO ExceptionGroups to expose underlying HTTP/MCP errors."""
+    if isinstance(exc, BaseExceptionGroup):
+        return [leaf for sub in exc.exceptions for leaf in _root_errors(sub)]
+    return [exc]
+
+def _explain_connection_error(exc: BaseException, url: str) -> str:
+    errors = _root_errors(exc)
+    details = "; ".join(f"{type(e).__name__}: {e}" for e in errors)
+    if any("401" in str(e) or "403" in str(e) for e in errors):
+        hint = "Check OHAMLAB_MCP_KEY and X-OhamLab-Key authentication."
+    elif any("404" in str(e) for e in errors):
+        hint = "Check the MCP URL path (including trailing /mcp/)."
+    elif any("307" in str(e) or "308" in str(e) for e in errors):
+        hint = "Use the canonical endpoint URL without redirects."
+    elif any("timeout" in type(e).__name__.lower() or "timed out" in str(e).lower() for e in errors):
+        hint = "Check server health and OHAMLAB_MCP_TIMEOUT."
+    else:
+        hint = "Check MCP server logs and the full exception traceback."
+    return f"Remote OhamLab MCP connection to {url} failed: {details}. {hint}"
 
 
 def _dump(value: Any) -> Any:
@@ -75,15 +99,20 @@ async def remote_mcp_session():
 
         headers[header_name] = key
 
-    async with streamablehttp_client(
-        url=url,
-        headers=headers,
-        timeout=timedelta(seconds=timeout),
-    ) as (read, write, _):
-
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            yield session
+    try:
+        async with streamablehttp_client(
+            url=url,
+            headers=headers,
+            timeout=timedelta(seconds=timeout),
+        ) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+    except Exception as exc:
+        # MCP's AnyIO transport can wrap HTTP errors in an ExceptionGroup.
+        # Keep the original traceback in logs, but surface the actual cause.
+        logger.exception("Remote MCP session failed: %s", url)
+        raise RuntimeError(_explain_connection_error(exc, url)) from exc
 
 
 async def discover_remote_tools() -> list[dict]:
