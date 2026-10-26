@@ -1,34 +1,39 @@
 [build-system]
-requires = ["hatchling>=1.26"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "ohamlab-agent-lab"
 version = "0.1.0"
-description = "A configurable agent runtime that connects LLMs to MCP tools."
+description = "Standalone agent runtime with REST, MCP, Gradio, Redis and persistent file storage"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "OhamLab contributors" }]
 dependencies = [
-  "ohamlab-agent>=0.1.2",
-  "mcp>=1.9.0",
-  "httpx>=0.27.0",
-  "openai>=1.60.0",
-  "anthropic>=0.45.0",
-  "pydantic>=2.7.0",
-  "PyYAML>=6.0.1",
+  "httpx>=0.27,<1",
+  "pydantic>=2.8,<3"
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "ruff>=0.9"]
+server = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "mcp>=1.9,<2",
+  "redis>=5.0,<7"
+]
+ui = ["gradio>=5.0,<6"]
+all = [
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "mcp>=1.9,<2",
+  "redis>=5.0,<7",
+  "gradio>=5.0,<6"
+]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8", "build>=1.2"]
 
-[project.scripts]
-ohamlab-agent = "ohamlab_agent_lab.cli:main"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/ohamlab_agent_lab"]
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
+pythonpath = ["src"]
 testpaths = ["tests"]

@@ -1,104 +1,87 @@
 from __future__ import annotations
 
-import json
-from typing import Any
+import os
+from typing import Awaitable, Callable
 
-from .llm import LLM
-from .mcp_tools import MCPTools
+import httpx
+
+from .models import AgentDefinition
+
+Workflow = Callable[[AgentDefinition, str], Awaitable[str]]
 
 
-def _truncate(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    return value[:limit] + "\n...[tool result truncated]"
+async def report_workflow(agent: AgentDefinition, task: str) -> str:
+    """A deterministic workflow; no model or API key is required."""
+    return (
+        f"## Task received\n\n{task}\n\n"
+        f"## Agent\n\n{agent.name}: {agent.description or 'No description provided.'}\n\n"
+        "## Execution mode\n\n"
+        "This is the built-in deterministic report workflow. It did not call an LLM "
+        "or execute arbitrary code. Register a dedicated workflow handler to perform "
+        "additional deterministic actions."
+    )
+
+
+async def echo_workflow(agent: AgentDefinition, task: str) -> str:
+    return f"{agent.name} received this task:\n\n{task}"
 
 
 class AgentRuntime:
-    def __init__(self, config):
-        self.config = config
-        self.llm = LLM(config.llm)
+    def __init__(self):
+        self.workflows: dict[str, Workflow] = {
+            "report": report_workflow,
+            "echo": echo_workflow,
+        }
 
-    async def list_tools(self) -> list[dict[str, Any]]:
-        async with MCPTools(self.config.mcp) as mcp:
-            return mcp.tools
+    def register_workflow(self, name: str, handler: Workflow) -> None:
+        if not name.strip():
+            raise ValueError("Workflow name cannot be empty")
+        self.workflows[name] = handler
 
-    async def ask(self, question: str, *, system_prompt: str | None = None, allowed_tools: list[str] | None = None) -> str:
-        async with MCPTools(self.config.mcp) as mcp:
-            available_tools = mcp.tools
-            if allowed_tools:
-                requested = set(allowed_tools)
-                available_tools = [tool for tool in mcp.tools if tool["name"] in requested]
-                missing = requested - {tool["name"] for tool in available_tools}
-                if missing:
-                    raise ValueError("Configured agent tools not exposed by MCP server: " + ", ".join(sorted(missing)))
-            messages: list[dict[str, Any]] = [
-                {"role": "system", "content": system_prompt or self.config.agent.system_prompt},
-                {"role": "user", "content": question},
-            ]
-            tool_by_name = {tool["name"]: tool for tool in available_tools}
+    async def run(self, agent: AgentDefinition, task: str) -> str:
+        if agent.execution_mode in ("workflow", "custom"):
+            handler = self.workflows.get(agent.workflow)
+            if not handler:
+                raise ValueError(f"Unknown workflow: {agent.workflow}")
+            return await handler(agent, task)
 
-            for _round in range(self.config.llm.max_tool_rounds):
-                response = await self.llm.respond(messages, available_tools)
-                calls = response["tool_calls"]
+        if agent.execution_mode == "llm":
+            return await self._run_llm(agent, task)
 
-                if not calls:
-                    return response["text"].strip() or "(The model returned no text.)"
+        raise ValueError(f"Unsupported execution mode: {agent.execution_mode}")
 
-                if self.config.llm.provider == "openai-compatible":
-                    raw = response["raw_message"]
-                    messages.append({
-                        "role": "assistant",
-                        "content": raw.content,
-                        "tool_calls": [
-                            {
-                                "id": c.id,
-                                "type": "function",
-                                "function": {
-                                    "name": c.function.name,
-                                    "arguments": c.function.arguments,
-                                },
-                            }
-                            for c in (raw.tool_calls or [])
-                        ],
-                    })
-                    for call in calls:
-                        name = call["name"]
-                        if name not in tool_by_name:
-                            result = json.dumps({"error": f"Unknown tool: {name}"})
-                        else:
-                            result = await mcp.call(name, call["arguments"])
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call["id"],
-                            "content": _truncate(result, self.config.llm.max_tool_result_chars),
-                        })
-                else:
-                    raw = response["raw_message"]
-                    messages.append({
-                        "role": "assistant",
-                        "content": [
-                            block.model_dump() if hasattr(block, "model_dump") else block
-                            for block in raw.content
-                        ],
-                    })
-                    tool_results = []
-                    for call in calls:
-                        name = call["name"]
-                        if name not in tool_by_name:
-                            result = json.dumps({"error": f"Unknown tool: {name}"})
-                            is_error = True
-                        else:
-                            result = await mcp.call(name, call["arguments"])
-                            is_error = False
-                        tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": call["id"],
-                            "content": _truncate(result, self.config.llm.max_tool_result_chars),
-                            "is_error": is_error,
-                        })
-                    messages.append({"role": "user", "content": tool_results})
-
-            return (
-                "Stopped because the maximum tool-call rounds were reached. "
-                "Try a narrower question or increase llm.max_tool_rounds."
+    async def _run_llm(self, agent: AgentDefinition, task: str) -> str:
+        base_url = (agent.base_url or os.getenv("LLM_BASE_URL", "")).rstrip("/")
+        model = agent.model or os.getenv("LLM_MODEL", "")
+        api_key = os.getenv(agent.api_key_env) or ""
+        if not base_url or not model:
+            raise ValueError(
+                "LLM agent requires base_url and model on the agent or "
+                "LLM_BASE_URL and LLM_MODEL environment variables."
             )
+        if not api_key:
+            raise ValueError(
+                f"Missing API key: set the environment variable {agent.api_key_env}."
+            )
+
+        # OpenAI-compatible chat completions. Tool calling is intentionally not
+        # implemented here yet; add provider-specific tool loops behind this adapter.
+        endpoint = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": agent.system_prompt},
+                {"role": "user", "content": task},
+            ],
+            "temperature": 0.2,
+        }
+        timeout = httpx.Timeout(90.0, connect=10.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(endpoint, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+        try:
+            return data["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError) as exc:
+            raise ValueError("Provider response did not contain choices[0].message.content") from exc
