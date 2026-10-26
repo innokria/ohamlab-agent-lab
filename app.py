@@ -413,6 +413,15 @@ with gr.Blocks(
 # --------------------------------------------------
 # FastAPI + REST + MCP + Gradio
 # --------------------------------------------------
+from contextlib import asynccontextmanager
+import os
+
+import gradio as gr
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -440,27 +449,31 @@ application.add_middleware(
 )
 
 
+# 1. Root redirects to Gradio UI
 @application.get("/", include_in_schema=False)
 async def home():
-    return RedirectResponse(url="/ui", status_code=307)
+    return RedirectResponse("/ui/", status_code=307)
 
 
+# 2. Mount the API under /api, not /
+application.mount("/api", api_app)
+
+# 3. Mount MCP
 application.mount("/mcp", mcp.streamable_http_app())
 
+# 4. Mount Gradio
 application = gr.mount_gradio_app(
     application,
     demo,
     path="/ui",
 )
 
-application.mount("/", api_app)
-
 
 if __name__ == "__main__":
-    import uvicorn
-
     uvicorn.run(
         application,
         host="0.0.0.0",
         port=int(os.getenv("PORT", "7860")),
+        log_level="info",
+        access_log=True,
     )
