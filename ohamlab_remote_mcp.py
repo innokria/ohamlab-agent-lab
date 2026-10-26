@@ -1,7 +1,7 @@
 """Remote OhamLab MCP tool-calling integration for Agent Lab.
 
 Requires: mcp>=1.0, openai>=1.0
-Environment: OHAMLAB_MCP_URL, LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
+Environment: OHAMLAB_MCP_URL (required for MCP workflows); LLM_* only for mcp_research
 Optional: OHAMLAB_MCP_KEY, OHAMLAB_MCP_AUTH_HEADER, OHAMLAB_MCP_TIMEOUT
 """
 from __future__ import annotations
@@ -46,6 +46,44 @@ async def discover_remote_tools() -> list[dict]:
         result = await session.list_tools()
         return [{"name": t.name, "description": t.description, "inputSchema": t.inputSchema}
                 for t in result.tools]
+
+
+async def run_mcp_search(task: str) -> str:
+    """LLM-free search using the remote MCP server; return actual tool output."""
+    query = task.strip()
+    if not query:
+        raise ValueError("Search query cannot be empty")
+    async with remote_mcp_session() as session:
+        tools = (await session.list_tools()).tools
+        # Prefer the server's search tool, not an arbitrary web-related tool.
+        candidates = sorted(
+            (t for t in tools if "search" in t.name.lower()),
+            key=lambda t: (t.name.lower() not in {"search", "web_search", "ohamlab_search"}, t.name),
+        )
+        if not candidates:
+            raise RuntimeError("Remote MCP server does not advertise a search tool")
+        for tool in candidates:
+            schema = tool.inputSchema or {}
+            props = schema.get("properties", {})
+            required = set(schema.get("required", []))
+            for field in ("query", "q", "search_query", "text"):
+                if field in props and required.issubset({field}):
+                    result = await session.call_tool(tool.name, arguments={field: query})
+                    if result.isError:
+                        raise RuntimeError(f"MCP tool {tool.name} failed: {_dump(result)}")
+                    blocks = []
+                    for part in result.content:
+                        if getattr(part, "type", "") == "text":
+                            blocks.append(part.text)
+                        else:
+                            blocks.append(json.dumps(_dump(part), ensure_ascii=False, default=str))
+                    if getattr(result, "structuredContent", None):
+                        blocks.append(json.dumps(result.structuredContent, ensure_ascii=False, default=str))
+                    return "\n\n".join(blocks) or "Search returned no content."
+        raise RuntimeError(
+            "No compatible search tool input schema found. Available: "
+            + json.dumps([{"name": t.name, "inputSchema": t.inputSchema} for t in candidates], default=str)
+        )
 
 
 async def run_with_remote_tools(agent: Any, task: str) -> str:
@@ -120,7 +158,9 @@ def install_runtime_integration(runtime: Any) -> None:
     async def run(agent: Any, task: str, *args, **kwargs):
         mode = str(getattr(agent, "execution_mode", "") or "").lower()
         workflow = str(getattr(agent, "workflow", "") or "").lower()
-        if os.getenv("OHAMLAB_MCP_URL") and (workflow in {"mcp_research", "remote_mcp"} or mode == "mcp_research"):
+        if workflow == "mcp_search" or mode == "mcp_search":
+            return await run_mcp_search(task)
+        if workflow in {"mcp_research", "remote_mcp"} or mode == "mcp_research":
             return await run_with_remote_tools(agent, task)
         return await original(agent, task, *args, **kwargs)
 
