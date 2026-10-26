@@ -64,7 +64,7 @@ def ensure_starter_agent():
                 name="Researcher",
                 description="Starter agent for research and report tasks.",
                 execution_mode="workflow",
-                workflow="mcp_research" if os.getenv("OHAMLAB_MCP_URL") else "report",
+                workflow="mcp_search",
                 system_prompt=(
                     "You are a helpful research agent. "
                     "Analyse the task, organise your findings, "
@@ -164,7 +164,7 @@ def create_agent_ui(
             name=name.strip(),
             description=description or "",
             execution_mode=mode,
-            workflow=workflow or "report",
+            workflow=workflow or "mcp_search",
             system_prompt=prompt or "You are a helpful assistant.",
             base_url=base_url or "",
             model=model or "",
@@ -757,8 +757,8 @@ with gr.Blocks(
                 )
 
                 workflow = gr.Dropdown(
-                    ["report", "echo", "mcp_research"],
-                    value="report",
+                    ["mcp_search", "mcp_research", "report", "echo"],
+                    value="mcp_search",
                     label="Workflow",
                 )
 
@@ -1328,7 +1328,7 @@ async def lifespan(app: FastAPI):
 
 
 application = FastAPI(
-    title="OhamLab Agent Lab",
+    title="OhamLab Agent Lab- search is mcp research is llm",
     lifespan=lifespan,
 )
 
