@@ -83,21 +83,23 @@ async def remote_mcp_session():
             "OHAMLAB_MCP_URL must be a valid HTTP(S) MCP endpoint"
         )
 
-    key = os.getenv("OHAMLAB_MCP_KEY", "").strip()
+    # Read the credential from the Agent Lab Space secret at request time.
+    # Never accept the key from task payloads or hard-code it in source.
+    key = os.environ.get("OHAMLAB_MCP_KEY", "").strip()
+    if not key:
+        raise RuntimeError(
+            "OHAMLAB_MCP_KEY is missing. Add it under Agent Lab Space "
+            "Settings > Variables and secrets > Secrets, then restart the Space."
+        )
 
     timeout = float(
         os.getenv("OHAMLAB_MCP_TIMEOUT", "60")
     )
 
-    headers = {}
-
-    if key:
-        header_name = os.getenv(
-            "OHAMLAB_MCP_AUTH_HEADER",
-            "X-OhamLab-Key",
-        )
-
-        headers[header_name] = key
+    header_name = os.getenv(
+        "OHAMLAB_MCP_AUTH_HEADER", "X-OhamLab-Key"
+    ).strip() or "X-OhamLab-Key"
+    headers = {header_name: key}
 
     try:
         async with streamablehttp_client(
