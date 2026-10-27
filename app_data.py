@@ -1359,12 +1359,6 @@ async def home():
 # REST API is mounted separately from the UI.
 application.mount("/api", api_app)
 
-# MCP endpoint.
-application.mount(
-    "/mcp",
-    mcp.streamable_http_app(),
-)
-
 # Gradio UI.
 application = gr.mount_gradio_app(
     application,
@@ -1373,6 +1367,12 @@ application = gr.mount_gradio_app(
     auth=(os.getenv("UIUSER", "admin"), os.environ["UIPASS"]),
     auth_message="Sign in to OhamLab Agent Lab",
 )
+
+# Mount MCP's ASGI app last at root. The SDK's streamable_http_app()
+# already owns the internal /mcp route, so mounting it at /mcp
+# would otherwise expose /mcp/mcp. Existing /api and /ui routes
+# take precedence because they were registered first.
+application.mount("/", mcp.streamable_http_app())
 
 
 # ============================================================
