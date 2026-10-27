@@ -24,6 +24,7 @@ from ohamlab_agent_lab.api import (
     runtime,
 )
 from ohamlab_agent_lab.mcp_server import mcp
+from mcp.server.transport_security import TransportSecuritySettings
 from ohamlab_agent_lab.models import CreateAgentRequest
 from ohamlab_remote_mcp import install_runtime_integration, discover_remote_tools
 
@@ -1320,6 +1321,22 @@ with gr.Blocks(
 # ============================================================
 # FastAPI + REST API + MCP + Gradio
 # ============================================================
+
+# Permit the public Hugging Face host while keeping MCP host validation enabled.
+# Configure this before constructing the MCP ASGI application.
+mcp.settings.transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        "rahul7star-ohamlab-agentic.hf.space",
+        "rahul7star-ohamlab-agentic.hf.space:*",
+        "localhost:*",
+        "127.0.0.1:*",
+    ],
+    allowed_origins=[
+        "https://rahul7star-ohamlab-agentic.hf.space",
+    ],
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
