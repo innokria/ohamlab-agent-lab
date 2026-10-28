@@ -1182,7 +1182,7 @@ with gr.Blocks(
             cc_status = gr.Dropdown(["All", "queued", "pending", "running", "completed", "failed", "cancelled"], value="All", label="Status", scale=1)
             cc_refresh = gr.Button("Refresh", scale=1)
         cc_summary = gr.Markdown()
-        cc_table = gr.Dataframe(headers=["Task ID", "Task", "Agent", "Status", "Created", "Updated", "Report", "Error"], interactive=False, label="Stored tasks", wrap=True, max_height=470)
+        cc_table = gr.Dataframe(headers=["Task ID", "Task", "Agent", "Status", "Created", "Updated", "Result", "Report", "Error"], interactive=False, label="Stored tasks", wrap=True, max_height=470)
         with gr.Row():
             cc_id = gr.Textbox(label="Inspect task ID", placeholder="Paste full task ID")
             cc_inspect = gr.Button("Open task", variant="primary")
@@ -1268,6 +1268,9 @@ with gr.Blocks(
                     str(t.task_id), instruction, agent_id, state,
                     str(getattr(t, "created_at", "")),
                     str(getattr(t, "updated_at", "")),
+                    (getattr(t, "result", None) if isinstance(getattr(t, "result", None), str)
+                     else json.dumps(getattr(t, "result"), ensure_ascii=False, default=str)
+                     if getattr(t, "result", None) is not None else ""),
                     str(getattr(t, "report_path", "")),
                     str(getattr(t, "error", "") or ""),
                 ])
