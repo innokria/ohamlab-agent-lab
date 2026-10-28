@@ -118,6 +118,7 @@ def task_rows():
             task.agent_id,
             task.status,
             str(task.created_at),
+            str(task.result),
             task.report_path,
             task.error,
         ]
@@ -1208,7 +1209,7 @@ with gr.Blocks(
                 if q and q not in " ".join([str(t.task_id), instruction, agent_id, state]).casefold():
                     continue
                 output.append([str(t.task_id), instruction, agent_id, state,
-                               str(getattr(t, "created_at", "")), str(getattr(t, "updated_at", "")),
+                               str(getattr(t, "created_at", "")), str(getattr(t, "result", "")) str(getattr(t, "updated_at", "")),
                                str(getattr(t, "report_path", "")), str(getattr(t, "error", ""))])
             return output, f"**Showing {len(output)} of {len(items)} stored tasks**"
 
