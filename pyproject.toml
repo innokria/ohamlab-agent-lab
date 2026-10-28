@@ -1,35 +1,52 @@
+
 [build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "ohamlab-agent-lab"
-version = "0.1.0"
-description = "Standalone agent runtime with REST, MCP, Gradio, Redis and persistent file storage"
+version = "7.0.0"
+description = "Standalone agent runtime with REST, MCP, Gradio and persistent storage"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = {text = "MIT"}
 dependencies = [
   "httpx>=0.27,<1",
-  "pydantic>=2.8,<3"
+  "pydantic>=2.8,<3",
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "mcp>=1.9,<2",
+  "gradio>=5.0,<6",
+  "datasets>=3.0",
+  "pandas>=2.2",
+  "openai>=1.0",
+  "anthropic",
+  "PyYAML>=6"
 ]
 
 [project.optional-dependencies]
-server = [
-  "fastapi>=0.115,<1",
-  "uvicorn[standard]>=0.30,<1",
-  "mcp>=1.9,<2",
-  "redis>=5.0,<7"
+redis = ["redis>=5.0,<7"]
+server = ["redis>=5.0,<7"]
+ui = []
+all = ["redis>=5.0,<7"]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.8",
+  "build>=1.2",
+  "twine>=6"
 ]
-ui = ["gradio>=5.0,<6"]
-all = [
-  "fastapi>=0.115,<1",
-  "uvicorn[standard]>=0.30,<1",
-  "mcp>=1.9,<2",
-  "redis>=5.0,<7",
-  "gradio>=5.0,<6"
-]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.8", "build>=1.2"]
+
+[project.scripts]
+ohamlab-lab = "ohamlab_agent_lab.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/innokria/ohamlab-agent-lab"
+Repository = "https://github.com/innokria/ohamlab-agent-lab"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["app_data", "ohamlab_remote_mcp"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
