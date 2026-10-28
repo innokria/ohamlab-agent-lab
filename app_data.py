@@ -120,6 +120,25 @@ def format_task_result(value):
     return json.dumps(value, indent=2, ensure_ascii=False, default=str)
 
 
+def task_trace_indicator(task_id):
+    """Return trace availability without modifying existing task storage."""
+    try:
+        task_id = str(task_id or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", task_id):
+            return "—"
+        trace_path = _LAB_ROOT / "tasks" / task_id / "trace.jsonl"
+        return "View traces" if trace_path.is_file() and trace_path.stat().st_size else "No traces"
+    except (OSError, ValueError):
+        return "No traces"
+
+
+def task_trace_display(task_id):
+    """Show persisted coding-task events; other tasks may not yet emit traces."""
+    if task_trace_indicator(task_id) != "View traces":
+        return "No execution traces recorded for this task."
+    return _lab_trace_view(task_id)
+
+
 def task_rows():
     return [
         [
@@ -128,6 +147,7 @@ def task_rows():
             task.status,
             str(task.created_at),
             format_task_result(task.result),
+            task_trace_indicator(task.task_id),
             task.report_path,
             task.error,
         ]
@@ -843,6 +863,43 @@ def _lab_task_path(tid):
     return _LAB_ROOT / "tasks" / tid
 
 
+# Append-only audit events live beside the existing task.json. No storage migration.
+def _lab_trace(tid, event_type, **details):
+    import hashlib
+    import time
+    task_dir = _lab_task_path(tid)
+    # Trace only operational metadata; never serialize prompts, generated source,
+    # raw model output, environment values, tokens, or HTTP credentials.
+    allowed = {"status", "attempt", "provider_id", "model", "file_count",
+               "files", "hashes", "duration_ms", "passed", "reason",
+               "test_output_sha256", "repo", "visibility", "github_url",
+               "error_type", "summary", "execution_mode"}
+    event = {"schema_version": 1, "event_id": uuid.uuid4().hex,
+             "task_id": tid, "timestamp": datetime.now(timezone.utc).isoformat(),
+             "event_type": event_type,
+             "data": {k: v for k, v in details.items() if k in allowed}}
+    # Lock prevents two threads from interleaving writes to the same trace.
+    with _LAB_LOCK:
+        with (task_dir / "trace.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+    return event
+
+
+def _lab_trace_view(tid):
+    try:
+        path = _lab_task_path(tid) / "trace.jsonl"
+        if not path.exists():
+            return "No trace events recorded for this task."
+        # Display the latest events without loading arbitrarily large files.
+        from collections import deque
+        with path.open(encoding="utf-8") as stream:
+            events = list(deque(stream, maxlen=150))
+        return "\n".join(json.dumps(json.loads(line), ensure_ascii=False, indent=2)
+                         for line in events if line.strip())
+    except Exception as exc:
+        return f"Trace unavailable: {type(exc).__name__}"
+
+
 def _lab_record(tid):
     return json.loads((_lab_task_path(tid) / "task.json").read_text(encoding="utf-8"))
 
@@ -919,11 +976,13 @@ def _lab_worker(tid):
         p = _lab_provider_get(record["provider_id"])
         client = _lab_client(p)
         _lab_update(tid, status="running")
+        _lab_trace(tid, "task_started", status="running", provider_id=p["id"], model=p["model"])
         previous = ""
         for attempt in range(1, 4):
             current = _lab_record(tid)
             if current["status"] == "cancelled":
                 return
+            _lab_trace(tid, "generation_started", attempt=attempt, model=p["model"])
             result = _lab_generate(client, p["model"], record["goal"], previous, attempt)
             files = result.get("files", [])
             if not isinstance(files, list) or not files or len(files) > _LAB_MAX_FILES:
@@ -939,6 +998,8 @@ def _lab_worker(tid):
                 if path.is_symlink():
                     raise ValueError("Symlink file is not permitted")
                 path.write_text(f["content"], encoding="utf-8")
+            _lab_trace(tid, "files_written", attempt=attempt, file_count=len(files),
+                       files=[str(f.get("path", "")) for f in files])
             # In environments without Docker, generate files but do not execute
             # untrusted model-generated Python on the Gradio host.
             if not shutil.which("docker"):
@@ -947,9 +1008,15 @@ def _lab_worker(tid):
                             files=sorted(str(f.relative_to(workspace)) for f in workspace.rglob("*") if f.is_file()),
                             summary=str(result.get("summary", ""))[:1000],
                             status="generated_unverified")
+                _lab_trace(tid, "execution_unavailable", attempt=attempt,
+                           status="generated_unverified", reason="isolated_runner_unavailable")
                 return
+            _lab_trace(tid, "test_started", attempt=attempt, execution_mode="docker")
             passed, output = _lab_run_tests(workspace)
             previous = output
+            import hashlib
+            _lab_trace(tid, "test_finished", attempt=attempt, passed=passed,
+                       test_output_sha256=hashlib.sha256(output.encode("utf-8")).hexdigest())
             _lab_update(tid, attempts=attempt, test_output=output,
                         files=sorted(str(f.relative_to(workspace)) for f in workspace.rglob("*") if f.is_file()),
                         summary=str(result.get("summary", ""))[:1000])
@@ -960,13 +1027,17 @@ def _lab_worker(tid):
                 hashes = {rel: hashlib.sha256(_lab_safe_file(workspace, rel).read_bytes()).hexdigest()
                           for rel in _lab_record(tid).get("files", [])}
                 _lab_update(tid, status="awaiting_approval", verified_hashes=hashes)
+                _lab_trace(tid, "approval_requested", status="awaiting_approval", hashes=hashes)
                 return
             if "sandbox unavailable" in output.lower():
                 _lab_update(tid, status="blocked", error=output)
+                _lab_trace(tid, "task_blocked", status="blocked", reason="sandbox_unavailable")
                 return
         _lab_update(tid, status="tests_failed", error="Tests did not pass after three attempts")
+        _lab_trace(tid, "task_finished", status="tests_failed")
     except Exception as exc:
         _lab_update(tid, status="failed", error=f"{type(exc).__name__}: {exc}"[:1200])
+        _lab_trace(tid, "task_finished", status="failed", error_type=type(exc).__name__)
     finally:
         if client is not None:
             client.close()
@@ -983,6 +1054,7 @@ def _lab_start(goal, provider_id):
         _lab_atomic(task_dir / "task.json", {"id": tid, "goal": goal.strip()[:8000],
                     "provider_id": provider_id, "status": "queued", "attempts": 0,
                     "created_at": datetime.now(timezone.utc).isoformat()})
+        _lab_trace(tid, "task_queued", status="queued", provider_id=provider_id)
         threading.Thread(target=_lab_worker, args=(tid,), daemon=True).start()
         return tid, f"Started task `{tid}`. Refresh status to follow progress."
     except Exception as exc:
@@ -1007,6 +1079,7 @@ def _lab_publish(tid, repo_name, visibility):
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         raise gr.Error("Set GITHUB_TOKEN as a server secret")
+    _lab_trace(tid, "publish_started", repo=repo_name, visibility=visibility)
     import requests
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
                "X-GitHub-Api-Version": "2022-11-28"}
@@ -1034,10 +1107,12 @@ def _lab_publish(tid, repo_name, visibility):
                                   headers=headers, json=payload, timeout=30)
             result.raise_for_status()
         _lab_update(tid, status="published", github_url=repo["html_url"])
+        _lab_trace(tid, "github_published", status="published", github_url=repo["html_url"])
         return f"Published to {repo['html_url']} ({len(record.get('files', []))} file commits)."
     except Exception as exc:
         # A repository may have been created even when uploading a later file fails.
         _lab_update(tid, status="publish_failed", error=f"GitHub publish failed: {exc}"[:1000])
+        _lab_trace(tid, "publish_failed", status="publish_failed", error_type=type(exc).__name__)
         raise gr.Error(f"Publishing may be partial. Check GitHub before retrying: {exc}") from exc
 
 
@@ -1045,6 +1120,7 @@ def _lab_cancel(tid):
     record = _lab_record(tid)
     if record["status"] in ("queued", "running"):
         _lab_update(tid, status="cancelled")
+        _lab_trace(tid, "cancellation_requested", status="cancelled")
         return "Cancellation requested. An active model call or sandbox test may finish first."
     return f"Task already {record['status']}"
 
@@ -1229,6 +1305,10 @@ with gr.Blocks(
         github_visibility = gr.Radio(["Private", "Public"], value="Private", label="Visibility")
         github_approve = gr.Button("Approve and publish to GitHub", variant="secondary")
         github_result = gr.Markdown()
+        gr.Markdown("### Execution traces (saved alongside existing task records)")
+        coding_trace_refresh = gr.Button("Refresh execution traces")
+        coding_trace_output = gr.Code(label="Recent trace events", language="json", lines=14)
+        coding_trace_refresh.click(_lab_trace_view, [coding_id], [coding_trace_output])
         coding_start.click(_lab_start, [coding_goal, coding_provider], [coding_id, coding_message])
         coding_refresh.click(_lab_status, [coding_id], [coding_result])
         coding_cancel.click(_lab_cancel, [coding_id], [coding_message])
@@ -1286,6 +1366,7 @@ with gr.Blocks(
                 "Status",
                 "Created",
                 "Result",
+                "Traces",
                 "Report",
                 "Error",
             ],
@@ -1322,6 +1403,7 @@ with gr.Blocks(
         task_details_error = gr.Textbox(
             label="Task error", lines=2, interactive=False,
         )
+        task_details_traces = gr.Code(label="Execution traces", language="json", lines=12)
 
         def inspect_task_with_result(task_id):
             data = inspect_task(task_id)
@@ -1329,12 +1411,13 @@ with gr.Blocks(
                 data,
                 format_task_result(data.get("result")),
                 str(data.get("error") or ""),
+                task_trace_display(task_id),
             )
 
         inspect_button.click(
             inspect_task_with_result,
             inputs=[task_id_input],
-            outputs=[details, task_details_result, task_details_error],
+            outputs=[details, task_details_result, task_details_error, task_details_traces],
         )
 
     # --------------------------------------------------------
@@ -1615,7 +1698,7 @@ with gr.Blocks(
             cc_status = gr.Dropdown(["All", "queued", "pending", "running", "completed", "failed", "cancelled"], value="All", label="Status", scale=1)
             cc_refresh = gr.Button("Refresh", scale=1)
         cc_summary = gr.Markdown()
-        cc_table = gr.Dataframe(headers=["Task ID", "Task", "Agent", "Status", "Created", "Updated", "Result", "Report", "Error"], interactive=False, label="Stored tasks", wrap=True, max_height=470)
+        cc_table = gr.Dataframe(headers=["Task ID", "Task", "Agent", "Status", "Created", "Updated", "Result", "Traces", "Report", "Error"], interactive=False, label="Stored tasks", wrap=True, max_height=470)
         with gr.Row():
             cc_id = gr.Textbox(label="Inspect task ID", placeholder="Paste full task ID")
             cc_inspect = gr.Button("Open task", variant="primary")
@@ -1634,6 +1717,14 @@ with gr.Blocks(
             interactive=False,
         )
 
+        cc_traces = gr.Code(
+            label="Execution traces for selected task",
+            language="json",
+            lines=14,
+            interactive=False,
+        )
+        cc_trace_refresh = gr.Button("Refresh selected task traces")
+
         def command_center_inspect(task_id):
             task_id = (task_id or "").strip()
             if not task_id:
@@ -1642,6 +1733,7 @@ with gr.Blocks(
                     "Select a task or enter its ID to view its result.",
                     "",
                     "",
+                    "No execution traces recorded for this task.",
                 )
             record = task_manager.get(task_id)
             if record is None:
@@ -1650,6 +1742,7 @@ with gr.Blocks(
                     f"**Task not found:** `{task_id}`",
                     "",
                     "",
+                    "No execution traces recorded for this task.",
                 )
             data = record.model_dump(mode="json")
             result_text = format_task_result(data.get("result"))
@@ -1660,14 +1753,14 @@ with gr.Blocks(
                 info += f" · **Report path:** `{report}`"
             if not result_text and state.lower() not in ("completed", "failed", "cancelled"):
                 result_text = "Task has not produced a result yet."
-            return data, info, result_text, str(getattr(record, "error", "") or "")
+            return data, info, result_text, str(getattr(record, "error", "") or ""), task_trace_display(task_id)
 
         def command_center_select(rows, evt: gr.SelectData):
             index = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
             try:
                 task_id = str(rows.iloc[int(index), 0] if hasattr(rows, "iloc") else rows[int(index)][0])
             except (IndexError, TypeError, ValueError):
-                return "", {"message": "Select a valid task row."}, "", "", ""
+                return "", {"message": "Select a valid task row."}, "", "", "", "No execution traces recorded for this task."
             return (task_id, *command_center_inspect(task_id))
 
         gr.Markdown("### Submit a task")
@@ -1696,6 +1789,7 @@ with gr.Blocks(
                     str(getattr(t, "created_at", "")),
                     str(getattr(t, "updated_at", "")),
                     format_task_result(getattr(t, "result", None)),
+                    task_trace_indicator(t.task_id),
                     str(getattr(t, "report_path", "")),
                     str(getattr(t, "error", "") or ""),
                 ])
@@ -1707,13 +1801,14 @@ with gr.Blocks(
         cc_inspect.click(
             command_center_inspect,
             [cc_id],
-            [cc_details, cc_result_status, cc_result, cc_result_error],
+            [cc_details, cc_result_status, cc_result, cc_result_error, cc_traces],
         )
         cc_table.select(
             command_center_select,
             [cc_table],
-            [cc_id, cc_details, cc_result_status, cc_result, cc_result_error],
+            [cc_id, cc_details, cc_result_status, cc_result, cc_result_error, cc_traces],
         )
+        cc_trace_refresh.click(task_trace_display, [cc_id], [cc_traces])
         cc_submit.click(run_agent_ui, [cc_agent, cc_instruction, cc_async],
                         [cc_submit_result, cc_created_id, current_tasks],
                         ).then(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
@@ -1722,7 +1817,7 @@ with gr.Blocks(
         cc_timer.tick(
             command_center_inspect,
             [cc_id],
-            [cc_details, cc_result_status, cc_result, cc_result_error],
+            [cc_details, cc_result_status, cc_result, cc_result_error, cc_traces],
         )
         demo.load(command_center_rows, outputs=[cc_table, cc_summary])
 
