@@ -704,7 +704,6 @@ def clear_dataset_filters():
 
 with gr.Blocks(
     title="OhamLab Agent Lab",
-    theme=gr.themes.Soft(),
 ) as demo:
 
     gr.Markdown(
@@ -1195,7 +1194,6 @@ with gr.Blocks(
             lines=14,
             max_lines=25,
             interactive=False,
-            show_copy_button=True,
         )
         cc_result_error = gr.Textbox(
             label="Task error (if any)",
