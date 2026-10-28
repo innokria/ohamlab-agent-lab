@@ -939,6 +939,15 @@ def _lab_worker(tid):
                 if path.is_symlink():
                     raise ValueError("Symlink file is not permitted")
                 path.write_text(f["content"], encoding="utf-8")
+            # In environments without Docker, generate files but do not execute
+            # untrusted model-generated Python on the Gradio host.
+            if not shutil.which("docker"):
+                _lab_update(tid, attempts=attempt,
+                            test_output="Tests not run: no isolated execution worker is configured.",
+                            files=sorted(str(f.relative_to(workspace)) for f in workspace.rglob("*") if f.is_file()),
+                            summary=str(result.get("summary", ""))[:1000],
+                            status="generated_unverified")
+                return
             passed, output = _lab_run_tests(workspace)
             previous = output
             _lab_update(tid, attempts=attempt, test_output=output,
@@ -968,8 +977,6 @@ def _lab_start(goal, provider_id):
         raise gr.Error("Enter a coding task")
     try:
         _lab_provider_get(provider_id)
-        if not shutil.which("docker"):
-            raise ValueError("Docker is not installed. Configure an isolated execution worker before starting coding tasks.")
         tid = uuid.uuid4().hex
         task_dir = _lab_task_path(tid)
         (task_dir / "workspace").mkdir(parents=True)
@@ -1207,7 +1214,7 @@ with gr.Blocks(
         provider_default.click(_lab_provider_default, [provider_pick], [provider_pick, provider_message])
 
     with gr.Tab("Autonomous Workspace"):
-        gr.Markdown("### Python coding agent\nWrites project files, tests in a Docker sandbox, retries fixes, then waits for explicit GitHub publishing approval. Docker must be available on the server or a dedicated worker.")
+        gr.Markdown("### Python coding agent\nGenerate Python project files with your selected LLM. If an isolated Docker runner is available, OhamLab also runs tests and retries fixes. Otherwise the task finishes as **generated_unverified**; no untrusted code runs on the app server, and GitHub publishing stays disabled until tests pass.")
         coding_provider = gr.Dropdown(label="Coding LLM provider", choices=_lab_provider_choices(),
                                      value=_lab_providers()["default"])
         coding_goal = gr.Textbox(label="Task", lines=5, placeholder="Build a Python expense tracker with unittest tests...")
