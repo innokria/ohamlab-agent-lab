@@ -108,10 +108,14 @@ async def _run(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="ohamlab-agent")
+    parser = argparse.ArgumentParser(prog="ohamlab-lab")
     parser.add_argument("--config", default="config.yaml", help="Path to YAML config")
     parser.add_argument("--data-dir", default=".ohamlab", help="Persistent agents/reports directory")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    serve = sub.add_parser("serve", help="Start local UI, API and MCP server")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=7860)
 
     sub.add_parser("check", help="Validate config without printing secrets")
     sub.add_parser("list-tools", help="Connect to MCP and list discovered tools")
@@ -139,6 +143,10 @@ def main():
 
     args = parser.parse_args()
     try:
+        if args.command == "serve":
+            import uvicorn
+            uvicorn.run("app_data:application", host=args.host, port=args.port)
+            return 0
         return asyncio.run(_run(args))
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)
