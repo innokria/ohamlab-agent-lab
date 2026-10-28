@@ -867,6 +867,7 @@ with gr.Blocks(
                 "Agent ID",
                 "Status",
                 "Created",
+                "Result",
                 "Report",
                 "Error",
             ],
@@ -1187,6 +1188,63 @@ with gr.Blocks(
             cc_id = gr.Textbox(label="Inspect task ID", placeholder="Paste full task ID")
             cc_inspect = gr.Button("Open task", variant="primary")
         cc_details = gr.JSON(label="Complete task record")
+        gr.Markdown("### Task result")
+        cc_result_status = gr.Markdown("Select a task or enter its ID to view its result.")
+        cc_result = gr.Textbox(
+            label="Agent output / result",
+            lines=14,
+            max_lines=25,
+            interactive=False,
+            show_copy_button=True,
+        )
+        cc_result_error = gr.Textbox(
+            label="Task error (if any)",
+            lines=2,
+            interactive=False,
+        )
+
+        def command_center_inspect(task_id):
+            task_id = (task_id or "").strip()
+            if not task_id:
+                return (
+                    {"message": "Select a task or enter its ID."},
+                    "Select a task or enter its ID to view its result.",
+                    "",
+                    "",
+                )
+            record = task_manager.get(task_id)
+            if record is None:
+                return (
+                    {"error": "Task not found", "task_id": task_id},
+                    f"**Task not found:** `{task_id}`",
+                    "",
+                    "",
+                )
+            data = record.model_dump(mode="json")
+            result = getattr(record, "result", None)
+            if result is None:
+                result_text = ""
+            elif isinstance(result, str):
+                result_text = result
+            else:
+                result_text = json.dumps(result, indent=2, ensure_ascii=False, default=str)
+            state = str(getattr(record, "status", "unknown"))
+            report = getattr(record, "report_path", None)
+            info = f"**Task:** `{task_id}` · **Status:** {state}"
+            if report:
+                info += f" · **Report path:** `{report}`"
+            if not result_text and state.lower() not in ("completed", "failed", "cancelled"):
+                result_text = "Task has not produced a result yet."
+            return data, info, result_text, str(getattr(record, "error", "") or "")
+
+        def command_center_select(rows, evt: gr.SelectData):
+            index = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
+            try:
+                task_id = str(rows[int(index)][0])
+            except (IndexError, TypeError, ValueError):
+                return "", {"message": "Select a valid task row."}, "", "", ""
+            return (task_id, *command_center_inspect(task_id))
+
         gr.Markdown("### Submit a task")
         with gr.Row():
             cc_agent = gr.Dropdown(choices=agent_choices(), label="Assigned agent", scale=2)
@@ -1208,20 +1266,38 @@ with gr.Blocks(
                     continue
                 if q and q not in " ".join([str(t.task_id), instruction, agent_id, state]).casefold():
                     continue
-                output.append([str(t.task_id), instruction, agent_id, state,
-                               str(getattr(t, "created_at", "")), str(getattr(t, "result", "")) str(getattr(t, "updated_at", "")),
-                               str(getattr(t, "report_path", "")), str(getattr(t, "error", ""))])
+                output.append([
+                    str(t.task_id), instruction, agent_id, state,
+                    str(getattr(t, "created_at", "")),
+                    str(getattr(t, "updated_at", "")),
+                    str(getattr(t, "report_path", "")),
+                    str(getattr(t, "error", "") or ""),
+                ])
             return output, f"**Showing {len(output)} of {len(items)} stored tasks**"
 
         cc_search.change(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
         cc_status.change(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
         cc_refresh.click(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
-        cc_inspect.click(inspect_task, [cc_id], [cc_details])
+        cc_inspect.click(
+            command_center_inspect,
+            [cc_id],
+            [cc_details, cc_result_status, cc_result, cc_result_error],
+        )
+        cc_table.select(
+            command_center_select,
+            [cc_table],
+            [cc_id, cc_details, cc_result_status, cc_result, cc_result_error],
+        )
         cc_submit.click(run_agent_ui, [cc_agent, cc_instruction, cc_async],
                         [cc_submit_result, cc_created_id, current_tasks],
                         ).then(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
         cc_timer = gr.Timer(8)
         cc_timer.tick(command_center_rows, [cc_search, cc_status], [cc_table, cc_summary])
+        cc_timer.tick(
+            command_center_inspect,
+            [cc_id],
+            [cc_details, cc_result_status, cc_result, cc_result_error],
+        )
         demo.load(command_center_rows, outputs=[cc_table, cc_summary])
 
     # ========================================================
