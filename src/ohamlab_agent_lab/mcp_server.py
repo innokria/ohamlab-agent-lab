@@ -6,6 +6,7 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 from .api import runtime, service, storage, task_manager
+from .models import CreateAgentRequest
 
 mcp = FastMCP("OhamLab Agent Lab")
 
@@ -18,6 +19,39 @@ def list_agents() -> list[dict]:
         for agent in service.list_agents()
         if agent.published_mcp
     ]
+
+
+@mcp.tool()
+def create_agent(
+    name: str,
+    description: str = "",
+    workflow: str = "mcp_search",
+    system_prompt: str = "You are a helpful research assistant. Cite source URLs and do not invent findings.",
+) -> dict:
+    """Create and publish a workflow agent for subsequent MCP task execution.
+
+    Supported workflows depend on the Agent Lab runtime configuration.
+    Defaults to the existing MCP web-search workflow.
+    """
+    if not name.strip():
+        return {"error": "Agent name cannot be empty"}
+    if not workflow.strip():
+        return {"error": "Workflow cannot be empty"}
+
+    try:
+        request = CreateAgentRequest(
+            name=name.strip(),
+            description=description.strip(),
+            execution_mode="workflow",
+            workflow=workflow.strip(),
+            system_prompt=system_prompt.strip(),
+            published_api=True,
+            published_mcp=True,
+        )
+        agent = service.create_agent(request)
+        return agent.model_dump(mode="json")
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 @mcp.tool()
