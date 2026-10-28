@@ -707,6 +707,341 @@ def clear_dataset_filters():
     )
 
 
+
+# ============================================================
+# Autonomous Workspace + LLM Providers (single-file extension)
+# ============================================================
+import re
+import threading
+import subprocess
+import shutil
+import uuid
+from urllib.parse import urlsplit
+
+_LAB_ROOT = Path(os.getenv("OHAMLAB_WORKSPACE_ROOT", "./data/agent_workspace")).resolve()
+_LAB_ROOT.mkdir(parents=True, exist_ok=True)
+_PROVIDERS_PATH = _LAB_ROOT / "providers.json"
+_LAB_LOCK = threading.RLock()
+_LAB_ENV_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_LAB_REPO_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+_LAB_MAX_FILES = 25
+_LAB_MAX_BYTES = 180_000
+
+
+def _lab_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _lab_providers():
+    with _LAB_LOCK:
+        if not _PROVIDERS_PATH.exists():
+            _lab_atomic(_PROVIDERS_PATH, {"default": "xing", "items": [{
+                "id": "xing", "name": "Xing",
+                "base_url": "https://rahul7star-xing4-0-29b-a4b.hf.space/v1",
+                "model": "Xing", "api_key_env": "HF_TOKEN"}]})
+        return json.loads(_PROVIDERS_PATH.read_text(encoding="utf-8"))
+
+
+def _lab_provider_choices():
+    data = _lab_providers()
+    return [(p["name"] + (" (default)" if p["id"] == data["default"] else ""), p["id"])
+            for p in data["items"]]
+
+
+def _lab_provider_get(pid):
+    data = _lab_providers()
+    for p in data["items"]:
+        if p["id"] == (pid or data["default"]):
+            return p
+    raise ValueError("Provider not found")
+
+
+def _lab_validate_provider(name, url, model_name, env_name):
+    name, url, model_name, env_name = [str(v or "").strip() for v in (name, url, model_name, env_name)]
+    parsed = urlsplit(url)
+    if not name or len(name) > 100 or not model_name or len(model_name) > 200:
+        raise ValueError("Name and model are required")
+    if (parsed.scheme not in ("https", "http") or not parsed.hostname or
+            parsed.username or parsed.password or parsed.query or parsed.fragment):
+        raise ValueError("Enter a valid HTTP(S) API URL without embedded credentials")
+    if parsed.scheme == "http" and parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        raise ValueError("Remote providers must use HTTPS")
+    if not _LAB_ENV_PATTERN.fullmatch(env_name):
+        raise ValueError("Enter an environment variable name, not an API key")
+    return {"name": name, "base_url": url.rstrip("/"), "model": model_name, "api_key_env": env_name}
+
+
+def _lab_provider_save(pid, name, url, model_name, env_name):
+    values = _lab_validate_provider(name, url, model_name, env_name)
+    with _LAB_LOCK:
+        data = _lab_providers()
+        if pid and pid != "__new__":
+            target = next((p for p in data["items"] if p["id"] == pid), None)
+            if target is None:
+                raise ValueError("Unknown provider")
+            target.update(values)
+        else:
+            target = {"id": uuid.uuid4().hex[:12], **values}
+            data["items"].append(target)
+        _lab_atomic(_PROVIDERS_PATH, data)
+    return (gr.update(choices=_lab_provider_choices(), value=target["id"]),
+            gr.update(choices=_lab_provider_choices(), value=target["id"]),
+            f"Saved provider **{target['name']}**")
+
+
+def _lab_provider_default(pid):
+    _lab_provider_get(pid)
+    with _LAB_LOCK:
+        data = _lab_providers()
+        data["default"] = pid
+        _lab_atomic(_PROVIDERS_PATH, data)
+    return gr.update(choices=_lab_provider_choices(), value=pid), "Default provider updated"
+
+
+def _lab_provider_fields(pid):
+    if pid == "__new__":
+        return "", "", "", ""
+    p = _lab_provider_get(pid)
+    return p["name"], p["base_url"], p["model"], p["api_key_env"]
+
+
+def _lab_client(provider):
+    from openai import OpenAI
+    key = os.getenv(provider["api_key_env"])
+    if not key:
+        raise ValueError(f"Set {provider['api_key_env']} in your Space secrets / environment")
+    return OpenAI(base_url=provider["base_url"], api_key=key, timeout=60, max_retries=0)
+
+
+def _lab_provider_test(pid):
+    p = _lab_provider_get(pid)
+    client = _lab_client(p)
+    try:
+        res = client.chat.completions.create(model=p["model"], messages=[
+            {"role": "user", "content": "Reply with OK"}], max_tokens=32)
+        return f"Connected to **{p['name']}**: {str(res.choices[0].message.content)[:160]}"
+    except Exception as exc:
+        return f"Connection failed: {type(exc).__name__}: {str(exc)[:300]}"
+    finally:
+        client.close()
+
+
+def _lab_provider_apply(pid):
+    p = _lab_provider_get(pid)
+    return p["base_url"], p["model"], p["api_key_env"]
+
+
+def _lab_task_path(tid):
+    if not re.fullmatch(r"[a-f0-9]{32}", str(tid or "")):
+        raise ValueError("Invalid task ID")
+    return _LAB_ROOT / "tasks" / tid
+
+
+def _lab_record(tid):
+    return json.loads((_lab_task_path(tid) / "task.json").read_text(encoding="utf-8"))
+
+
+def _lab_update(tid, **updates):
+    with _LAB_LOCK:
+        record = _lab_record(tid)
+        record.update(updates)
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _lab_atomic(_lab_task_path(tid) / "task.json", record)
+        return record
+
+
+def _lab_safe_file(workspace, name):
+    candidate = Path(str(name))
+    if (candidate.is_absolute() or ".." in candidate.parts or not candidate.parts or
+            any(part.startswith(".") for part in candidate.parts) or
+            any(part in ("__pycache__", "node_modules") for part in candidate.parts)):
+        raise ValueError(f"Unsafe file path: {name}")
+    dest = (workspace / candidate).resolve()
+    if not dest.is_relative_to(workspace.resolve()):
+        raise ValueError("Path escapes workspace")
+    return dest
+
+
+def _lab_extract_json(text_value):
+    text_value = str(text_value or "").strip()
+    if text_value.startswith("```"):
+        text_value = re.sub(r"^```(?:json)?\s*|\s*```$", "", text_value, flags=re.I)
+    return json.loads(text_value)
+
+
+def _lab_generate(client, model_name, goal, previous, iteration):
+    instructions = ("You are a Python coding agent. Return ONLY a JSON object with keys "
+                    "files and summary. files is an array of objects with path and content. "
+                    "Write a complete small Python project with unittest tests (test_*.py). "
+                    "No external dependencies, no secrets, no network access. "
+                    "Each response must include the complete desired content of each changed file. "
+                    "Do not output markdown. Limit to 20 files and 120000 characters total.")
+    user_prompt = f"GOAL:\n{goal}\nITERATION: {iteration}\nPREVIOUS TEST OUTPUT:\n{previous[-5000:]}"
+    response = client.chat.completions.create(model=model_name,
+        messages=[{"role": "system", "content": instructions},
+                  {"role": "user", "content": user_prompt}], max_tokens=5000)
+    return _lab_extract_json(response.choices[0].message.content)
+
+
+def _lab_run_tests(workspace):
+    if not list(workspace.rglob("test_*.py")):
+        return False, "No test_*.py files were generated; refusing to mark task as verified."
+    # Deliberately fail closed: never execute LLM-generated code in the Gradio host.
+    if not shutil.which("docker"):
+        return False, "Docker sandbox unavailable. Configure an isolated worker; host execution is disabled."
+    cmd = ["docker", "run", "--rm", "--network", "none", "--cpus", "1", "--memory", "512m",
+           "--pids-limit", "96", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+           "--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m",
+           "--user", "65534:65534", "--mount", f"type=bind,src={workspace},dst=/work,readonly",
+           "--workdir", "/work", "--env", "PYTHONDONTWRITEBYTECODE=1",
+           os.getenv("OHAMLAB_SANDBOX_IMAGE", "python:3.12-slim"),
+           "python", "-m", "unittest", "discover", "-s", ".", "-p", "test_*.py", "-v"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90, check=False)
+        return result.returncode == 0, (result.stdout + "\n" + result.stderr)[-10000:]
+    except subprocess.TimeoutExpired:
+        return False, "Sandbox tests timed out after 90 seconds"
+    except Exception as exc:
+        return False, f"Sandbox error: {exc}"
+
+
+def _lab_worker(tid):
+    workspace = _lab_task_path(tid) / "workspace"
+    record = _lab_record(tid)
+    client = None
+    try:
+        p = _lab_provider_get(record["provider_id"])
+        client = _lab_client(p)
+        _lab_update(tid, status="running")
+        previous = ""
+        for attempt in range(1, 4):
+            current = _lab_record(tid)
+            if current["status"] == "cancelled":
+                return
+            result = _lab_generate(client, p["model"], record["goal"], previous, attempt)
+            files = result.get("files", [])
+            if not isinstance(files, list) or not files or len(files) > _LAB_MAX_FILES:
+                raise ValueError("Model did not return a valid bounded file list")
+            total = sum(len(str(f.get("content", "")).encode("utf-8")) for f in files)
+            if total > _LAB_MAX_BYTES:
+                raise ValueError("Generated files exceed size limit")
+            for f in files:
+                if not isinstance(f, dict) or not isinstance(f.get("content"), str):
+                    raise ValueError("Invalid generated file")
+                path = _lab_safe_file(workspace, f.get("path", ""))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if path.is_symlink():
+                    raise ValueError("Symlink file is not permitted")
+                path.write_text(f["content"], encoding="utf-8")
+            passed, output = _lab_run_tests(workspace)
+            previous = output
+            _lab_update(tid, attempts=attempt, test_output=output,
+                        files=sorted(str(f.relative_to(workspace)) for f in workspace.rglob("*") if f.is_file()),
+                        summary=str(result.get("summary", ""))[:1000])
+            if passed:
+                if _lab_record(tid)["status"] == "cancelled":
+                    return
+                import hashlib
+                hashes = {rel: hashlib.sha256(_lab_safe_file(workspace, rel).read_bytes()).hexdigest()
+                          for rel in _lab_record(tid).get("files", [])}
+                _lab_update(tid, status="awaiting_approval", verified_hashes=hashes)
+                return
+            if "sandbox unavailable" in output.lower():
+                _lab_update(tid, status="blocked", error=output)
+                return
+        _lab_update(tid, status="tests_failed", error="Tests did not pass after three attempts")
+    except Exception as exc:
+        _lab_update(tid, status="failed", error=f"{type(exc).__name__}: {exc}"[:1200])
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _lab_start(goal, provider_id):
+    if not str(goal or "").strip():
+        raise gr.Error("Enter a coding task")
+    try:
+        _lab_provider_get(provider_id)
+        if not shutil.which("docker"):
+            raise ValueError("Docker is not installed. Configure an isolated execution worker before starting coding tasks.")
+        tid = uuid.uuid4().hex
+        task_dir = _lab_task_path(tid)
+        (task_dir / "workspace").mkdir(parents=True)
+        _lab_atomic(task_dir / "task.json", {"id": tid, "goal": goal.strip()[:8000],
+                    "provider_id": provider_id, "status": "queued", "attempts": 0,
+                    "created_at": datetime.now(timezone.utc).isoformat()})
+        threading.Thread(target=_lab_worker, args=(tid,), daemon=True).start()
+        return tid, f"Started task `{tid}`. Refresh status to follow progress."
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+
+
+def _lab_status(tid):
+    try:
+        record = _lab_record(tid)
+        return json.dumps(record, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        return f"Could not load task: {exc}"
+
+
+def _lab_publish(tid, repo_name, visibility):
+    # Only publish completed, verified runs, after an explicit UI click.
+    record = _lab_record(tid)
+    if record["status"] != "awaiting_approval":
+        raise gr.Error("Task must pass tests and await approval before publishing")
+    if not _LAB_REPO_PATTERN.fullmatch(str(repo_name or "")) or repo_name in (".", ".."):
+        raise gr.Error("Enter a valid new GitHub repository name")
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise gr.Error("Set GITHUB_TOKEN as a server secret")
+    import requests
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+    api = "https://api.github.com"
+    try:
+        # Create a NEW repository only; never overwrite an existing repository.
+        response = requests.post(api + "/user/repos", headers=headers, json={
+            "name": repo_name, "private": visibility == "Private", "auto_init": True}, timeout=30)
+        response.raise_for_status()
+        repo = response.json()
+        owner = repo["owner"]["login"]
+        import base64
+        workspace = _lab_task_path(tid) / "workspace"
+        for rel in record.get("files", []):
+            path = _lab_safe_file(workspace, rel)
+            if not path.is_file() or path.is_symlink():
+                raise ValueError("File changed since test execution; refusing to publish")
+            import hashlib
+            if hashlib.sha256(path.read_bytes()).hexdigest() != record.get("verified_hashes", {}).get(rel):
+                raise ValueError("File changed after testing; refusing to publish")
+            payload = {"message": f"Add {rel} from OhamLab task {tid[:8]}",
+                       "content": base64.b64encode(path.read_bytes()).decode("ascii")}
+            from urllib.parse import quote
+            result = requests.put(f"{api}/repos/{owner}/{repo_name}/contents/{quote(rel, safe='/')}",
+                                  headers=headers, json=payload, timeout=30)
+            result.raise_for_status()
+        _lab_update(tid, status="published", github_url=repo["html_url"])
+        return f"Published to {repo['html_url']} ({len(record.get('files', []))} file commits)."
+    except Exception as exc:
+        # A repository may have been created even when uploading a later file fails.
+        _lab_update(tid, status="publish_failed", error=f"GitHub publish failed: {exc}"[:1000])
+        raise gr.Error(f"Publishing may be partial. Check GitHub before retrying: {exc}") from exc
+
+
+def _lab_cancel(tid):
+    record = _lab_record(tid)
+    if record["status"] in ("queued", "running"):
+        _lab_update(tid, status="cancelled")
+        return "Cancellation requested. An active model call or sandbox test may finish first."
+    return f"Task already {record['status']}"
+
+
 # ============================================================
 # Gradio UI
 # ============================================================
@@ -778,19 +1113,25 @@ with gr.Blocks(
                     value="You are a helpful research assistant.",
                 )
 
+                provider_for_agent = gr.Dropdown(
+                    label="Saved LLM provider (loads fields below)",
+                    choices=_lab_provider_choices(),
+                    value=_lab_providers()["default"],
+                )
+
                 base_url = gr.Textbox(
                     label="LLM base URL",
-                    value=os.getenv("LLM_BASE_URL", ""),
+                    value=_lab_provider_get(None)["base_url"],
                 )
 
                 model = gr.Textbox(
                     label="LLM model",
-                    value=os.getenv("LLM_MODEL", ""),
+                    value=_lab_provider_get(None)["model"],
                 )
 
                 api_key_env = gr.Textbox(
                     label="API key environment variable",
-                    value="LLM_API_KEY",
+                    value=_lab_provider_get(None)["api_key_env"],
                 )
 
                 publish_api = gr.Checkbox(
@@ -838,6 +1179,53 @@ with gr.Blocks(
     # --------------------------------------------------------
     # Run task
     # --------------------------------------------------------
+
+    with gr.Tab("LLM Providers"):
+        gr.Markdown("### Saved OpenAI-compatible endpoints\nSecrets stay in server environment variables, not in this UI.")
+        with gr.Row():
+            with gr.Column():
+                provider_pick = gr.Dropdown(label="Saved provider", choices=_lab_provider_choices(),
+                                            value=_lab_providers()["default"])
+                new_provider = gr.Button("New provider")
+                provider_name = gr.Textbox(label="Provider name", value="Xing")
+                provider_url = gr.Textbox(label="LLM base URL", value=_lab_provider_get(None)["base_url"])
+                provider_model = gr.Textbox(label="LLM model", value=_lab_provider_get(None)["model"])
+                provider_secret = gr.Textbox(label="API key environment variable", value=_lab_provider_get(None)["api_key_env"])
+                with gr.Row():
+                    provider_save = gr.Button("Save provider", variant="primary")
+                    provider_test = gr.Button("Test connection")
+                    provider_default = gr.Button("Set default")
+                provider_message = gr.Markdown()
+        provider_pick.change(_lab_provider_fields, [provider_pick],
+                             [provider_name, provider_url, provider_model, provider_secret])
+        new_provider.click(lambda: ("__new__", "", "", "", ""), outputs=[
+            provider_pick, provider_name, provider_url, provider_model, provider_secret])
+        provider_save.click(_lab_provider_save,
+                            [provider_pick, provider_name, provider_url, provider_model, provider_secret],
+                            [provider_pick, provider_for_agent, provider_message])
+        provider_test.click(_lab_provider_test, [provider_pick], [provider_message])
+        provider_default.click(_lab_provider_default, [provider_pick], [provider_pick, provider_message])
+
+    with gr.Tab("Autonomous Workspace"):
+        gr.Markdown("### Python coding agent\nWrites project files, tests in a Docker sandbox, retries fixes, then waits for explicit GitHub publishing approval. Docker must be available on the server or a dedicated worker.")
+        coding_provider = gr.Dropdown(label="Coding LLM provider", choices=_lab_provider_choices(),
+                                     value=_lab_providers()["default"])
+        coding_goal = gr.Textbox(label="Task", lines=5, placeholder="Build a Python expense tracker with unittest tests...")
+        coding_start = gr.Button("Start coding task", variant="primary")
+        coding_id = gr.Textbox(label="Task ID")
+        coding_message = gr.Markdown()
+        coding_refresh = gr.Button("Refresh task status")
+        coding_result = gr.Code(label="Task status / test output", language="json")
+        coding_cancel = gr.Button("Request cancellation")
+        gr.Markdown("### Publish approved project to a NEW GitHub repository")
+        github_repo = gr.Textbox(label="New repository name")
+        github_visibility = gr.Radio(["Private", "Public"], value="Private", label="Visibility")
+        github_approve = gr.Button("Approve and publish to GitHub", variant="secondary")
+        github_result = gr.Markdown()
+        coding_start.click(_lab_start, [coding_goal, coding_provider], [coding_id, coding_message])
+        coding_refresh.click(_lab_status, [coding_id], [coding_result])
+        coding_cancel.click(_lab_cancel, [coding_id], [coding_message])
+        github_approve.click(_lab_publish, [coding_id, github_repo, github_visibility], [github_result])
 
     with gr.Tab("Run task"):
 
@@ -1364,6 +1752,9 @@ with gr.Blocks(
     # ========================================================
     # Shared event handlers
     # ========================================================
+
+    provider_for_agent.change(_lab_provider_apply, [provider_for_agent],
+                              [base_url, model, api_key_env])
 
     create_button.click(
         create_agent_ui,
