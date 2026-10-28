@@ -111,6 +111,15 @@ def agent_rows():
     ]
 
 
+def format_task_result(value):
+    """Render persisted task results consistently across every UI view."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, indent=2, ensure_ascii=False, default=str)
+
+
 def task_rows():
     return [
         [
@@ -118,7 +127,7 @@ def task_rows():
             task.agent_id,
             task.status,
             str(task.created_at),
-            str(task.result),
+            format_task_result(task.result),
             task.report_path,
             task.error,
         ]
@@ -857,6 +866,21 @@ with gr.Blocks(
 
         run_result = gr.Markdown()
         task_id_output = gr.Textbox(label="Task ID")
+        run_task_result = gr.Textbox(label="Saved task result", lines=10, interactive=False)
+        run_task_error = gr.Textbox(label="Saved task error", lines=2, interactive=False)
+        run_task_refresh = gr.Button("Refresh task result")
+
+        def refresh_run_task_result(task_id):
+            record = task_manager.get((task_id or "").strip()) if task_id else None
+            if record is None:
+                return "", ""
+            return format_task_result(record.result), str(record.error or "")
+
+        run_task_refresh.click(
+            refresh_run_task_result,
+            inputs=[task_id_output],
+            outputs=[run_task_result, run_task_error],
+        )
 
         gr.Markdown("### Task history")
 
@@ -897,11 +921,25 @@ with gr.Blocks(
         )
 
         details = gr.JSON(label="Task details")
+        task_details_result = gr.Textbox(
+            label="Task result", lines=12, interactive=False,
+        )
+        task_details_error = gr.Textbox(
+            label="Task error", lines=2, interactive=False,
+        )
+
+        def inspect_task_with_result(task_id):
+            data = inspect_task(task_id)
+            return (
+                data,
+                format_task_result(data.get("result")),
+                str(data.get("error") or ""),
+            )
 
         inspect_button.click(
-            inspect_task,
+            inspect_task_with_result,
             inputs=[task_id_input],
-            outputs=[details],
+            outputs=[details, task_details_result, task_details_error],
         )
 
     # --------------------------------------------------------
@@ -1219,13 +1257,7 @@ with gr.Blocks(
                     "",
                 )
             data = record.model_dump(mode="json")
-            result = getattr(record, "result", None)
-            if result is None:
-                result_text = ""
-            elif isinstance(result, str):
-                result_text = result
-            else:
-                result_text = json.dumps(result, indent=2, ensure_ascii=False, default=str)
+            result_text = format_task_result(data.get("result"))
             state = str(getattr(record, "status", "unknown"))
             report = getattr(record, "report_path", None)
             info = f"**Task:** `{task_id}` · **Status:** {state}"
@@ -1238,7 +1270,7 @@ with gr.Blocks(
         def command_center_select(rows, evt: gr.SelectData):
             index = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
             try:
-                task_id = str(rows[int(index)][0])
+                task_id = str(rows.iloc[int(index), 0] if hasattr(rows, "iloc") else rows[int(index)][0])
             except (IndexError, TypeError, ValueError):
                 return "", {"message": "Select a valid task row."}, "", "", ""
             return (task_id, *command_center_inspect(task_id))
@@ -1262,15 +1294,13 @@ with gr.Blocks(
                 state = str(getattr(t, "status", ""))
                 if status != "All" and state.casefold() != status.casefold():
                     continue
-                if q and q not in " ".join([str(t.task_id), instruction, agent_id, state]).casefold():
+                if q and q not in " ".join([str(t.task_id), instruction, agent_id, state, format_task_result(getattr(t, "result", None))]).casefold():
                     continue
                 output.append([
                     str(t.task_id), instruction, agent_id, state,
                     str(getattr(t, "created_at", "")),
                     str(getattr(t, "updated_at", "")),
-                    (getattr(t, "result", None) if isinstance(getattr(t, "result", None), str)
-                     else json.dumps(getattr(t, "result"), ensure_ascii=False, default=str)
-                     if getattr(t, "result", None) is not None else ""),
+                    format_task_result(getattr(t, "result", None)),
                     str(getattr(t, "report_path", "")),
                     str(getattr(t, "error", "") or ""),
                 ])
@@ -1393,6 +1423,11 @@ with gr.Blocks(
     timer.tick(
         task_rows,
         outputs=[current_tasks],
+    )
+    timer.tick(
+        refresh_run_task_result,
+        inputs=[task_id_output],
+        outputs=[run_task_result, run_task_error],
     )
 
 
