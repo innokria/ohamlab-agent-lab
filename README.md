@@ -1,13 +1,7 @@
----
-title: OhamLab Agent Lab
-emoji: 🧪
-colorFrom: purple
-colorTo: blue
-sdk: docker
-app_port: 7860
-pinned: false
----
-
+## pypy
+```
+pip install ohamlab-agent-lab==7.0.0
+```
 # OhamLab Agent Lab
 
 Standalone agent platform with Gradio UI, REST API, inbound MCP, optional LLMs,
