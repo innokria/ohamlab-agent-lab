@@ -15,7 +15,16 @@ from .service import AgentService
 from .storage import FileStorage
 from .tasks import TaskManager
 
-DATA_DIR = Path(os.getenv("OHAM_DATA_DIR", "/data/ohamlab-agent-lab"))
+def _default_data_dir() -> Path:
+    configured = os.getenv("OHAM_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    if os.getenv("SPACE_ID"):
+        return Path("/data/ohamlab-agent-lab")
+    return Path.home() / ".ohamlab-agent-lab"
+
+
+DATA_DIR = _default_data_dir()
 storage = FileStorage(DATA_DIR)
 runtime = AgentRuntime()
 task_manager = TaskManager(storage, runtime, os.getenv("REDIS_URL", ""))
@@ -27,7 +36,7 @@ class CloneRequest(BaseModel):
 
 
 def create_api() -> FastAPI:
-    api = FastAPI(title="OhamLab Agent Lab API", version="0.1.0")
+    api = FastAPI(title="OhamLab Agent Lab API", version="7.0.0")
     install_auth_middleware(api)
 
     @api.get("/health")
