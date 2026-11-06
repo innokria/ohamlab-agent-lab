@@ -317,7 +317,7 @@ async def run_with_remote_tools(
         1,
         min(
             20,
-            int(os.getenv("OHAMLAB_MAX_TOOL_CALLS", "28")),
+            int(os.getenv("OHAMLAB_MAX_TOOL_CALLS", "8")),
         ),
     )
 
